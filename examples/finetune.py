@@ -7,9 +7,7 @@ import os
 import re
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 import numpy as np
-import orbax.checkpoint
 import optax
 import sentencepiece as spm
 import tensorflow_datasets as tfds
@@ -20,16 +18,14 @@ from gemma import params as params_lib
 from gemma import sampler as sampler_lib
 from gemma import transformer as transformer_lib
 
-_PRETRAINED_CHECKPOINT_PATH = flags.DEFINE_string("check_path", "/opt/gemma/models/Flax/2b-it/2/2b-it", "Path to pretrained model weights and state.")
-_VOCAB_PATH = flags.DEFINE_string("vocab_path", "/opt/gemma/models/Flax/2b-it/2/tokenizer.model", "Path to tokenizer model for tokenization.")
+_PRETRAINED_CHECKPOINT_PATH = flags.DEFINE_string("check_path", "/tmp/models/gemma/Flax/2b-it/2/2b-it", "Path to pretrained model weights and state.")
+_VOCAB_PATH = flags.DEFINE_string("vocab_path", "/tmp/models/gemma/Flax/2b-it/2/tokenizer.model", "Path to tokenizer model for tokenization.")
 _BATCH_SIZE = flags.DEFINE_integer("batch_size", 4, "Batch size for finetuning.")
 _SEQ_LEN = flags.DEFINE_integer("seq_len", 8 * 1024, "Sequence length for finetuning.")
 _LEARNING_RATE = flags.DEFINE_float("lr", 1e-4, "Learning rate for finetuning.")
 _LOG_FREQ = flags.DEFINE_integer("log_freq", 32, "Loss loggging frequency in number of iterations.")
 _EVAL_FREQ = flags.DEFINE_integer("eval_freq", 96, "Evaluation frequency in number of iterations.")
 _EPOCHS = flags.DEFINE_integer("epochs", 5, "Evaluation frequency in number of iterations.")
-_BENCHMARK = flags.DEFINE_boolean("benchmark", False, "Whether or not to benchmark computation.")
-_MULTIDEVICE = flags.DEFINE_boolean("multi_device", False, "Whether or not to use .")
 
 ParameterPytree = Dict[str, Any]
 GEMMA_PARTITION_RULES = [
@@ -53,9 +49,9 @@ GEMMA_PARTITION_RULES = [
             (("pre_ffw_norm", "scale"), PartitionSpec(None)),
 
             # Attn layer
-            (("attn", "q_einsum"), PartitionSpec('TP', None, None)),
-            (("attn", "kv_einsum"), PartitionSpec(None, None, None, None)),
-            (("attn", "attn_vec_einsum"), PartitionSpec('TP', None, None)),
+            (("attn", "q_einsum", "w"), PartitionSpec('TP', None, None)),
+            (("attn", "kv_einsum", "w"), PartitionSpec(None, None, None, None)),
+            (("attn", "attn_vec_einsum", "w"), PartitionSpec('TP', None, None)),
 
             # MLP layer
             (("mlp", "gating_einsum"), PartitionSpec(None, None, 'TP')),
@@ -71,6 +67,10 @@ def shard_parameters(params: ParameterPytree, mesh: Mesh) -> ParameterPytree:
             part_dict = part_dict.setdefault(key, {})       
         part_dict[key_path[-1]] = sharding
     
+    def create_global_sharded_array(leaf: jax.Array, keypath, partition_dict) -> jax.Array:
+        sharding = reduce(operator.getitem, [obj.key for obj in keypath], partition_dict)
+        return jax.make_array_from_process_local_data(sharding, leaf, leaf.shape)
+
     partition_dict = {}
     for layer in params['params']:
         for pattern, rules in GEMMA_PARTITION_RULES:
@@ -80,8 +80,9 @@ def shard_parameters(params: ParameterPytree, mesh: Mesh) -> ParameterPytree:
                     if leaf_path[0] in params['params'][layer].keys():
                         partition_dict_set(partition_dict, layer, leaf_path, NamedSharding(mesh, spec))
 
-    partitioned_parameters = jax.tree_util.tree_map_with_path(lambda keypath, leaf: 
-                                                              jax.device_put(leaf, reduce(operator.getitem, [obj.key for obj in keypath], partition_dict)), 
+
+    partitioned_parameters = jax.tree_util.tree_map_with_path(lambda keypath, leaf:
+                                                              create_global_sharded_array(leaf, keypath, partition_dict),
                                                               params)
     return partitioned_parameters
 
@@ -237,15 +238,21 @@ def main(argv: Sequence[str]) -> None:
 
     # Init / load model parameters
     config, model, params = load_model_params(_PRETRAINED_CHECKPOINT_PATH.value)
-    print(f"Process {jax.process_index()} on node {os.environ.get('SLURM_NODEID')}")
 
     # Shard model parameters
-    if _MULTIDEVICE.value:
-        num_local_devices = jax.local_device_count()
-        assert config.num_heads % num_local_devices == 0, "number of available device must be evenly divide number of attention heads"
-        devices = np.asarray(jax.devices()).reshape(-1, num_local_devices)
-        mesh = Mesh(devices, ('DP', 'TP'))
-        params = shard_parameters(params, mesh)
+    dp_dim = int(os.environ.get("SLURM_NNODES"))
+    tp_dim = len(jax.devices()) // dp_dim
+    assert config.num_heads % tp_dim == 0, "number of devices in the TP mesh dim must be evenly divide number of attention heads"
+    devices = np.asarray(jax.devices()).reshape(dp_dim, tp_dim)
+    mesh = Mesh(devices, ('DP', 'TP'))
+    params = shard_parameters(params, mesh)
+
+    # Load vocab tokenizer, create datasets and distributed dataloader
+    vocab = spm.SentencePieceProcessor()
+    vocab.Load(_VOCAB_PATH.value)
+    tokenizer = EtoFTokenizer(vocab)
+
+    print(f"Process {jax.process_index()} on node {os.environ.get('SLURM_NODEID')}: pad ID = {tokenizer.pad_id}")
 
 
 if __name__ == "__main__":
