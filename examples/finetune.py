@@ -20,6 +20,7 @@ from gemma import transformer as transformer_lib
 
 _PRETRAINED_CHECKPOINT_PATH = flags.DEFINE_string("check_path", "/tmp/models/gemma/Flax/2b-it/2/2b-it", "Path to pretrained model weights and state.")
 _VOCAB_PATH = flags.DEFINE_string("vocab_path", "/tmp/models/gemma/Flax/2b-it/2/tokenizer.model", "Path to tokenizer model for tokenization.")
+_DATASET_DIR = flags.DEFINE_string("data_dir", "/tmp/datasets", "Path to datasets directory")
 _BATCH_SIZE = flags.DEFINE_integer("batch_size", 4, "Batch size for finetuning.")
 _SEQ_LEN = flags.DEFINE_integer("seq_len", 8 * 1024, "Sequence length for finetuning.")
 _LEARNING_RATE = flags.DEFINE_float("lr", 1e-4, "Learning rate for finetuning.")
@@ -140,7 +141,7 @@ class EtoFMTNTDataset(data.Dataset):
     def __init__(self, tokenizer: EtoFTokenizer, max_seq_len: int, mode: str):
         assert mode == 'train' or mode =='valid'
         self._tokenizer = tokenizer
-        self._base_data = list(tfds.load("mtnt/en-fr", split=mode).as_numpy_iterator())
+        self._base_data = list(tfds.load("mtnt/en-fr", data_dir=_DATASET_DIR.value, split=mode).as_numpy_iterator())
         self._max_seq_len = max_seq_len
 
     def _pad_upto_max_len(self, input_tensor: jax.Array, pad_value: int | bool) -> jax.Array:
@@ -240,7 +241,7 @@ def main(argv: Sequence[str]) -> None:
     config, model, params = load_model_params(_PRETRAINED_CHECKPOINT_PATH.value)
 
     # Shard model parameters
-    dp_dim = int(os.environ.get("SLURM_NNODES"))
+    dp_dim = int(os.environ.get("SLURM_NNODES")) # Scheduler dependent (assumed SLURM here)
     tp_dim = len(jax.devices()) // dp_dim
     assert config.num_heads % tp_dim == 0, "number of devices in the TP mesh dim must be evenly divide number of attention heads"
     devices = np.asarray(jax.devices()).reshape(dp_dim, tp_dim)
@@ -248,11 +249,33 @@ def main(argv: Sequence[str]) -> None:
     params = shard_parameters(params, mesh)
 
     # Load vocab tokenizer, create datasets and distributed dataloader
+    dp_rank = int(os.environ.get("SLURM_NODEID")) # Scheduler dependent (assumed SLURM here)
     vocab = spm.SentencePieceProcessor()
     vocab.Load(_VOCAB_PATH.value)
     tokenizer = EtoFTokenizer(vocab)
+    assert _BATCH_SIZE.value % dp_dim == 0, "batch size must be divisble by number data parallel dimension of the mesh"
+    
+    if jax.process_index() == 0:
+        train_dataset =  EtoFMTNTDataset(tokenizer, max_seq_len=_SEQ_LEN.value, mode='train')
+        valid_dataset = EtoFMTNTDataset(tokenizer, max_seq_len=_SEQ_LEN.value, mode='valid')
 
-    print(f"Process {jax.process_index()} on node {os.environ.get('SLURM_NODEID')}: pad ID = {tokenizer.pad_id}")
+    sampler = lambda dataset: data.DistributedSampler(dataset, num_replicas=dp_dim, rank=dp_rank)
+
+    train_dataloader = data.DataLoader(train_dataset, 
+                                       sampler=sampler(train_dataset), 
+                                       shuffle=False, 
+                                       batch_size=_BATCH_SIZE.value // dp_dim, 
+                                       collate_fn=EtoFMTNTDataset.collator
+    )
+
+    valid_dataloader = data.DataLoader(valid_dataset, 
+                                       sampler=sampler(valid_dataset), 
+                                       shuffle=False, 
+                                       batch_size=_BATCH_SIZE.value // dp_dim, 
+                                       collate_fn=EtoFMTNTDataset.collator
+    )
+
+    #print(f"Process {jax.process_index()} on node {os.environ.get('SLURM_NODEID')}: dp_rank = {dp_rank}")
 
 
 if __name__ == "__main__":
