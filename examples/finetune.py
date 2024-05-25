@@ -1,4 +1,4 @@
-from typing import Any, Iterable, Tuple, Sequence, Dict
+from typing import Any, Callable, Iterable, Tuple, Sequence, Dict
 from absl import app, flags, logging
 from functools import partial, reduce
 from timeit import default_timer as timer
@@ -255,10 +255,8 @@ def main(argv: Sequence[str]) -> None:
     tokenizer = EtoFTokenizer(vocab)
     assert _BATCH_SIZE.value % dp_dim == 0, "batch size must be divisble by number data parallel dimension of the mesh"
     
-    if jax.process_index() == 0:
-        train_dataset =  EtoFMTNTDataset(tokenizer, max_seq_len=_SEQ_LEN.value, mode='train')
-        valid_dataset = EtoFMTNTDataset(tokenizer, max_seq_len=_SEQ_LEN.value, mode='valid')
-
+    train_dataset =  EtoFMTNTDataset(tokenizer, max_seq_len=_SEQ_LEN.value, mode='train')
+    valid_dataset = EtoFMTNTDataset(tokenizer, max_seq_len=_SEQ_LEN.value, mode='valid')
     sampler = lambda dataset: data.DistributedSampler(dataset, num_replicas=dp_dim, rank=dp_rank)
 
     train_dataloader = data.DataLoader(train_dataset, 
@@ -275,7 +273,16 @@ def main(argv: Sequence[str]) -> None:
                                        collate_fn=EtoFMTNTDataset.collator
     )
 
-    #print(f"Process {jax.process_index()} on node {os.environ.get('SLURM_NODEID')}: dp_rank = {dp_rank}")
+    
+    jitted_train_step = jax.jit(partial(train_step, model), static_argnames=['optimizer'])
+    jitted_eval_step = jax.jit(partial(eval_step, model))
+
+    optimizer = optax.adam(learning_rate=_LEARNING_RATE.value)
+    opt_state = optimizer.init(params)
+
+    logging.info("Beginning finetuning...")
+
+
 
 
 if __name__ == "__main__":
