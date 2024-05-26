@@ -24,9 +24,9 @@ _DATASET_DIR = flags.DEFINE_string("data_dir", "/tmp/datasets", "Path to dataset
 _BATCH_SIZE = flags.DEFINE_integer("batch_size", 4, "Batch size for finetuning.")
 _SEQ_LEN = flags.DEFINE_integer("seq_len", 8 * 1024, "Sequence length for finetuning.")
 _LEARNING_RATE = flags.DEFINE_float("lr", 1e-4, "Learning rate for finetuning.")
-_LOG_FREQ = flags.DEFINE_integer("log_freq", 32, "Loss loggging frequency in number of iterations.")
-_EVAL_FREQ = flags.DEFINE_integer("eval_freq", 96, "Evaluation frequency in number of iterations.")
-_EPOCHS = flags.DEFINE_integer("epochs", 5, "Evaluation frequency in number of iterations.")
+_LOG_FREQ = flags.DEFINE_integer("log_freq", 64, "Loss loggging frequency in number of iterations.")
+_EVAL_FREQ = flags.DEFINE_integer("eval_freq", 256, "Evaluation frequency in number of iterations.")
+_EPOCHS = flags.DEFINE_integer("epochs", 1, "Evaluation frequency in number of iterations.")
 
 ParameterPytree = Dict[str, Any]
 GEMMA_PARTITION_RULES = [
@@ -68,7 +68,7 @@ def shard_parameters(params: ParameterPytree, mesh: Mesh) -> ParameterPytree:
             part_dict = part_dict.setdefault(key, {})       
         part_dict[key_path[-1]] = sharding
     
-    def create_global_sharded_array(leaf: jax.Array, keypath, partition_dict) -> jax.Array:
+    def create_global_sharded_array(leaf: jax.Array, keypath: Tuple[str], partition_dict) -> jax.Array:
         sharding = reduce(operator.getitem, [obj.key for obj in keypath], partition_dict)
         return jax.make_array_from_process_local_data(sharding, leaf, leaf.shape)
 
@@ -233,9 +233,10 @@ def eval_step(
 
 def main(argv: Sequence[str]) -> None:
     if len(argv) > 1:
-       raise app.UsageError("Too many command-line arguments.")
-    
+       raise app.UsageError("Too many command-line arguments.") 
+
     jax.distributed.initialize()
+    global_rank = jax.process_index()
 
     # Init / load model parameters
     config, model, params = load_model_params(_PRETRAINED_CHECKPOINT_PATH.value)
@@ -248,7 +249,7 @@ def main(argv: Sequence[str]) -> None:
     mesh = Mesh(devices, ('DP', 'TP'))
     params = shard_parameters(params, mesh)
 
-    # Load vocab tokenizer, create datasets and distributed dataloader
+    # Load vocab, tokenizer, create datasets and distributed dataloader
     dp_rank = int(os.environ.get("SLURM_NODEID")) # Scheduler dependent (assumed SLURM here)
     vocab = spm.SentencePieceProcessor()
     vocab.Load(_VOCAB_PATH.value)
@@ -279,10 +280,58 @@ def main(argv: Sequence[str]) -> None:
 
     optimizer = optax.adam(learning_rate=_LEARNING_RATE.value)
     opt_state = optimizer.init(params)
+    
+    # Barrier to ensure chronological printing
+    jax.experimental.multihost_utils.sync_global_devices("all")
+    
+    avg_loss = 0
+    n_steps = 0
+    for epoch in range(_EPOCHS.value):
+        train_dataloader.sampler.set_epoch(epoch)
+        print(f"--------------- Rank {global_rank} starting epoch {epoch} ---------------")
+        for i, (tokens, mask) in enumerate(train_dataloader):
+            global_tokens = jax.make_array_from_process_local_data(NamedSharding(mesh, PartitionSpec("DP", None)), 
+                                                                tokens, 
+                                                                (_BATCH_SIZE.value, _SEQ_LEN.value)
+            )
 
-    logging.info("Beginning finetuning...")
+            global_mask = jax.make_array_from_process_local_data(NamedSharding(mesh, PartitionSpec("DP", None)), 
+                                                                mask, 
+                                                                (_BATCH_SIZE.value, _SEQ_LEN.value)
+            )
 
 
+            train_loss, params, opt_state = jitted_train_step(params, optimizer, opt_state, global_tokens, global_mask, tokenizer.pad_id)
+
+            n_steps += 1
+            avg_loss += train_loss
+            if (i + 1) % _LOG_FREQ.value == 0:
+                # Only print statistics on rank 0
+                if global_rank == 0:
+                    print(f"Epoch {epoch + 1}, iteration {i + 1}: Average Loss = {avg_loss / n_steps}")
+                
+                avg_loss = 0
+                n_steps = 0
+            
+            if (i + 1) % _EVAL_FREQ.value == 0:
+                eval_loss = 0
+                n_eval_steps = 0
+                for _, (tokens, mask) in enumerate(valid_dataloader):
+                    global_tokens = jax.make_array_from_process_local_data(NamedSharding(mesh, PartitionSpec("DP", None)), 
+                                                                           tokens, 
+                                                                           (_BATCH_SIZE.value, _SEQ_LEN.value)
+                    )
+
+                    global_mask = jax.make_array_from_process_local_data(NamedSharding(mesh, PartitionSpec("DP", None)), 
+                                                                         mask, 
+                                                                         (_BATCH_SIZE.value, _SEQ_LEN.value)
+                    )
+
+                    eval_loss += jitted_eval_step(params, global_tokens, global_mask, tokenizer.pad_id)
+                    n_eval_steps += 1
+                
+                if global_rank == 0:
+                    print(f"Average eval loss = {eval_loss / n_eval_steps}")
 
 
 if __name__ == "__main__":
