@@ -1,7 +1,6 @@
-from typing import Any, Callable, Iterable, Tuple, Sequence, Dict
+from typing import Any, Iterable, Tuple, Sequence, Dict
 from absl import app, flags, logging
 from functools import partial, reduce
-from timeit import default_timer as timer
 import operator
 import os
 import re
@@ -15,7 +14,6 @@ from torch.utils import data
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 
 from gemma import params as params_lib
-from gemma import sampler as sampler_lib
 from gemma import transformer as transformer_lib
 
 _PRETRAINED_CHECKPOINT_PATH = flags.DEFINE_string("check_path", "/tmp/models/gemma/Flax/2b-it/2/2b-it", "Path to pretrained model weights and state.")
@@ -27,6 +25,9 @@ _LEARNING_RATE = flags.DEFINE_float("lr", 1e-4, "Learning rate for finetuning.")
 _LOG_FREQ = flags.DEFINE_integer("log_freq", 64, "Loss loggging frequency in number of iterations.")
 _EVAL_FREQ = flags.DEFINE_integer("eval_freq", 256, "Evaluation frequency in number of iterations.")
 _EPOCHS = flags.DEFINE_integer("epochs", 1, "Evaluation frequency in number of iterations.")
+_JAX_CACHE = flags.DEFINE_string("jax_cache", None, "Path to jax persistent cache on shared filesystem between all processes.")
+_JAX_SHARE_BINARY_BETWEEN_HOSTS = flags.DEFINE_boolean("share_binary", False, "Whether to share binary between hosts instead of every host compiling.")
+_JAX_CACHE_ONLY = flags.DEFINE_boolean("cache_only", False, "Whether to just cache by doing a dummy computation or proceed with training after compilation.")
 
 ParameterPytree = Dict[str, Any]
 GEMMA_PARTITION_RULES = [
@@ -87,7 +88,15 @@ def shard_parameters(params: ParameterPytree, mesh: Mesh) -> ParameterPytree:
                                                               params)
     return partitioned_parameters
 
-
+def shard_inputs(*inputs: Tuple[jax.Array], 
+                 global_input_shapes: Tuple[Tuple[int]], 
+                 input_shardings: Tuple[NamedSharding]
+) -> Tuple[jax.Array]:
+    partitioned_inputs = tuple(jax.make_array_from_process_local_data(input_shardings[i], 
+                                                                      input, 
+                                                                      global_input_shapes[i]) 
+                                                                      for i, input in enumerate(inputs))
+    return partitioned_inputs
 
 class EtoFTokenizer:
     def __init__(self, spm_processor: spm.SentencePieceProcessor):
@@ -233,7 +242,10 @@ def eval_step(
 
 def main(argv: Sequence[str]) -> None:
     if len(argv) > 1:
-       raise app.UsageError("Too many command-line arguments.") 
+       raise app.UsageError("Too many command-line arguments.")
+    
+    jax.config.update("jax_compilation_cache_dir", _JAX_CACHE.value)
+    jax.config.update("jax_share_binary_between_hosts", _JAX_SHARE_BINARY_BETWEEN_HOSTS.value)
 
     jax.distributed.initialize()
     global_rank = jax.process_index()
@@ -290,16 +302,10 @@ def main(argv: Sequence[str]) -> None:
         train_dataloader.sampler.set_epoch(epoch)
         print(f"--------------- Rank {global_rank} starting epoch {epoch} ---------------")
         for i, (tokens, mask) in enumerate(train_dataloader):
-            global_tokens = jax.make_array_from_process_local_data(NamedSharding(mesh, PartitionSpec("DP", None)), 
-                                                                tokens, 
-                                                                (_BATCH_SIZE.value, _SEQ_LEN.value)
-            )
-
-            global_mask = jax.make_array_from_process_local_data(NamedSharding(mesh, PartitionSpec("DP", None)), 
-                                                                mask, 
-                                                                (_BATCH_SIZE.value, _SEQ_LEN.value)
-            )
-
+            global_tokens, global_mask = shard_inputs(tokens, 
+                                                      mask, 
+                                                      global_input_shapes=((_BATCH_SIZE.value, _SEQ_LEN.value), (_BATCH_SIZE.value, _SEQ_LEN.value)), 
+                                                      input_shardings=(NamedSharding(mesh, PartitionSpec("DP", None)), NamedSharding(mesh, PartitionSpec("DP", None))))
 
             train_loss, params, opt_state = jitted_train_step(params, optimizer, opt_state, global_tokens, global_mask, tokenizer.pad_id)
 
@@ -317,16 +323,11 @@ def main(argv: Sequence[str]) -> None:
                 eval_loss = 0
                 n_eval_steps = 0
                 for _, (tokens, mask) in enumerate(valid_dataloader):
-                    global_tokens = jax.make_array_from_process_local_data(NamedSharding(mesh, PartitionSpec("DP", None)), 
-                                                                           tokens, 
-                                                                           (_BATCH_SIZE.value, _SEQ_LEN.value)
-                    )
-
-                    global_mask = jax.make_array_from_process_local_data(NamedSharding(mesh, PartitionSpec("DP", None)), 
-                                                                         mask, 
-                                                                         (_BATCH_SIZE.value, _SEQ_LEN.value)
-                    )
-
+                    global_tokens, global_mask = shard_inputs(tokens, 
+                                                              mask, 
+                                                              global_input_shapes=((_BATCH_SIZE.value, _SEQ_LEN.value), (_BATCH_SIZE.value, _SEQ_LEN.value)), 
+                                                              input_shardings=(NamedSharding(mesh, PartitionSpec("DP", None)), NamedSharding(mesh, PartitionSpec("DP", None))))                    
+ 
                     eval_loss += jitted_eval_step(params, global_tokens, global_mask, tokenizer.pad_id)
                     n_eval_steps += 1
                 
