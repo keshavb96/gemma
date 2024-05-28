@@ -228,7 +228,7 @@ def train_step(
    loss, grads = jax.value_and_grad(model_forward_and_loss, argnums=1)(model, params, tokens, input_mask, positions, attention_mask)
    updates, opt_state = optimizer.update(grads, opt_state)
    params = optax.apply_updates(params, updates)
-   return loss, params, opt_state
+   return loss, params, opt_state, grads
 
 def eval_step(
       model: transformer_lib.Transformer,
@@ -248,7 +248,10 @@ def main(argv: Sequence[str]) -> None:
     jax.config.update("jax_share_binary_between_hosts", _JAX_SHARE_BINARY_BETWEEN_HOSTS.value)
 
     jax.distributed.initialize()
-    global_rank = jax.process_index()
+
+    # Simplifying printing for multiple process setting
+    # Only global_rank 0 prints
+    print_dist = lambda *inputs: print(*inputs) if jax.process_index() == 0 else None
 
     # Init / load model parameters
     config, model, params = load_model_params(_PRETRAINED_CHECKPOINT_PATH.value)
@@ -295,12 +298,29 @@ def main(argv: Sequence[str]) -> None:
     
     # Barrier to ensure chronological printing
     jax.experimental.multihost_utils.sync_global_devices("all")
+
+    # Only run a single iteration on both the jitted training and eval functions
+    # if _JAX_CACHE_ONLY is true
+    if _JAX_CACHE.value is not None and _JAX_CACHE_ONLY.value:
+        print_dist(f"cache_only is set to {True}, only compiling and caching traing and eval functions")
+        train_tokens, train_mask = next(iter(train_dataloader))
+        val_tokens, val_mask = next(iter(valid_dataloader))
+        global_train_tokens, global_train_mask, global_val_tokens, global_val_mask = shard_inputs(train_tokens, train_mask, val_tokens, val_mask,
+                                                                                                  global_input_shapes=tuple((_BATCH_SIZE.value, _SEQ_LEN.value) for _ in range(4)),
+                                                                                                  input_shardings=tuple(NamedSharding(mesh, PartitionSpec("DP", None)) for _ in range(4)))
+        train_loss, params, opt_state, grads = jitted_train_step(params, optimizer, opt_state, global_train_tokens, global_train_mask, tokenizer.pad_id)
+        _ = jitted_eval_step(params, global_val_tokens, global_val_mask, tokenizer.pad_id)
+        jax.experimental.multihost_utils.sync_global_devices("all")
+        print_dist(f"Finished compiling and caching train and validation functions...exiting")
+        return
+        
+
     
     avg_loss = 0
     n_steps = 0
     for epoch in range(_EPOCHS.value):
         train_dataloader.sampler.set_epoch(epoch)
-        print(f"--------------- Rank {global_rank} starting epoch {epoch} ---------------")
+        print(f"--------------- Rank {jax.process_index()} starting epoch {epoch} ---------------")
         for i, (tokens, mask) in enumerate(train_dataloader):
             global_tokens, global_mask = shard_inputs(tokens, 
                                                       mask, 
@@ -312,10 +332,7 @@ def main(argv: Sequence[str]) -> None:
             n_steps += 1
             avg_loss += train_loss
             if (i + 1) % _LOG_FREQ.value == 0:
-                # Only print statistics on rank 0
-                if global_rank == 0:
-                    print(f"Epoch {epoch + 1}, iteration {i + 1}: Average Loss = {avg_loss / n_steps}")
-                
+                print_dist(f"Epoch {epoch + 1}, iteration {i + 1}: Average Loss = {avg_loss / n_steps}")
                 avg_loss = 0
                 n_steps = 0
             
@@ -331,8 +348,7 @@ def main(argv: Sequence[str]) -> None:
                     eval_loss += jitted_eval_step(params, global_tokens, global_mask, tokenizer.pad_id)
                     n_eval_steps += 1
                 
-                if global_rank == 0:
-                    print(f"Average eval loss = {eval_loss / n_eval_steps}")
+                print_dist(f"Average eval loss = {eval_loss / n_eval_steps}")
 
 
 if __name__ == "__main__":
