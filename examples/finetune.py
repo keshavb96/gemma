@@ -228,7 +228,7 @@ def train_step(
    loss, grads = jax.value_and_grad(model_forward_and_loss, argnums=1)(model, params, tokens, input_mask, positions, attention_mask)
    updates, opt_state = optimizer.update(grads, opt_state)
    params = optax.apply_updates(params, updates)
-   return loss, params, opt_state, grads
+   return loss, params, opt_state
 
 def eval_step(
       model: transformer_lib.Transformer,
@@ -308,7 +308,12 @@ def main(argv: Sequence[str]) -> None:
         global_train_tokens, global_train_mask, global_val_tokens, global_val_mask = shard_inputs(train_tokens, train_mask, val_tokens, val_mask,
                                                                                                   global_input_shapes=tuple((_BATCH_SIZE.value, _SEQ_LEN.value) for _ in range(4)),
                                                                                                   input_shardings=tuple(NamedSharding(mesh, PartitionSpec("DP", None)) for _ in range(4)))
-        train_loss, params, opt_state, grads = jitted_train_step(params, optimizer, opt_state, global_train_tokens, global_train_mask, tokenizer.pad_id)
+        
+        # Need to compile train step twice to account for opt_state count not being sharded in the first call
+        # A patch could be made in optax to ensure that the count in adam is also sharded during init
+        _, _, opt_state = jitted_train_step(params, optimizer, opt_state, global_train_tokens, global_train_mask, tokenizer.pad_id)
+        _, _, _ = jitted_train_step(params, optimizer, opt_state, global_train_tokens, global_train_mask, tokenizer.pad_id)
+
         _ = jitted_eval_step(params, global_val_tokens, global_val_mask, tokenizer.pad_id)
         jax.experimental.multihost_utils.sync_global_devices("all")
         print_dist(f"Finished compiling and caching train and validation functions...exiting")
